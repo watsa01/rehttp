@@ -607,3 +607,57 @@ func TestClientRetryWithBodyNoRace(t *testing.T) {
 	actualAttempts := atomic.LoadInt32(&totalAttempts)
 	assert.Equal(t, expectedAttempts, actualAttempts)
 }
+
+// TestClientRetryWithBodyAndPerAttemptTimeout verifies that when
+// PerAttemptTimeout is configured, the request body is correctly
+// reset between retry attempts. Regression test for the case where
+// reqWithTimeout (a shallow clone of req produced by req.WithContext)
+// had its Body field reset, but req.Body remained pointing at the
+// already-consumed original reader, causing the next attempt to send
+// an empty body and fail with "ContentLength=N with Body length 0".
+func TestClientRetryWithBodyAndPerAttemptTimeout(t *testing.T) {
+	var attemptCount int32
+	var secondAttemptBody string
+	var mu sync.Mutex
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&attemptCount, 1)
+		body, _ := io.ReadAll(r.Body)
+		if n == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		mu.Lock()
+		secondAttemptBody = string(body)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	tr := NewTransport(
+		nil,
+		RetryAll(RetryMaxRetries(2), RetryStatuses(http.StatusBadGateway)),
+		ConstDelay(0),
+	)
+	tr.PerAttemptTimeout = 5 * time.Second
+
+	client := &http.Client{Transport: tr}
+
+	const payload = "hello-world-body-payload"
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/x", strings.NewReader(payload))
+	require.NoError(t, err)
+	// Null out GetBody so that http.Transport's internal rewindBody
+	// cannot mask an incorrect body reset by rehttp itself.
+	req.GetBody = nil
+
+	res, err := client.Do(req)
+	require.NoError(t, err)
+	defer res.Body.Close()
+
+	assert.Equal(t, http.StatusOK, res.StatusCode)
+	assert.Equal(t, int32(2), atomic.LoadInt32(&attemptCount))
+	mu.Lock()
+	got := secondAttemptBody
+	mu.Unlock()
+	assert.Equal(t, payload, got, "retry attempt must resend full request body")
+}
