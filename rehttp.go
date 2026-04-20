@@ -378,7 +378,14 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			// Per Go's doc: "RoundTrip should not modify the request,
 			// except for consuming and closing the Body", so the only thing
 			// to reset on the request is the body, if any.
-			reqWithTimeout.Body = ioutil.NopCloser(bytes.NewReader(bodyBytes))
+			//
+			// Reset req.Body rather than reqWithTimeout.Body: when
+			// PerAttemptTimeout is set, reqWithTimeout is a shallow clone
+			// of req produced by req.WithContext, so assigning to
+			// reqWithTimeout.Body does not update req.Body. The next
+			// iteration re-derives reqWithTimeout from req, and would
+			// otherwise inherit the already-consumed original body.
+			req.Body = ioutil.NopCloser(bytes.NewReader(bodyBytes))
 		}
 		// close the disposed response's body, if any
 		if res != nil {
